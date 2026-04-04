@@ -1,55 +1,75 @@
 # Synapse
 
-Synapse turns a single seed URL or block of text into a living research notebook. It discovers related sources, crawls and summarizes them, maps the relationships into a source graph, and lets you ask grounded questions against the resulting knowledge base.
+Synapse is a research workspace that turns a single source into a connected body of knowledge. Start with a URL or a block of text, let Synapse discover and process related material, then explore the resulting graph and ask grounded questions against it.
 
-Built for hackathon demos, Synapse is designed to feel fast, visual, and easy to explain:
+## Overview
 
-- Start from one link or pasted note
-- Auto-discover related sources across the web
-- Build a knowledge graph showing how sources connect
-- Chat with the notebook using source-grounded retrieval
-- Run a frontend-only demo mode when you just need the pitch to work
+Most research tools either collect links or generate answers. Synapse does both, while keeping the source network visible.
 
-## What It Does
+With Synapse, you can:
 
-Synapse helps researchers, students, founders, and judges go from "I have one interesting source" to "I understand the space" in minutes.
+- Start from one article, paper, note, or URL
+- Discover related sources across the web
+- Crawl, summarize, and embed each source
+- Visualize how ideas connect in a source graph
+- Chat with the notebook using retrieval grounded in processed sources
 
-The workflow:
+## Core Capabilities
 
-1. Seed the notebook with a URL or pasted text.
-2. Extract the main topic and discover related sources.
+### Source-Centered Research
+
+Every notebook begins with a seed input and grows into a structured set of related sources instead of an opaque conversation thread.
+
+### Knowledge Graph Exploration
+
+Synapse maps relationships between sources so users can move from isolated documents to a broader understanding of a topic.
+
+### Grounded Q&A
+
+Chat responses are generated from retrieved notebook context, helping answers stay tied to the collected material.
+
+### Flexible Runtime
+
+The app supports a lightweight in-memory mode for local development and an optional Supabase-backed mode for persistence.
+
+## How It Works
+
+1. Create a notebook from a seed URL or pasted text.
+2. Extract the topic and discover relevant related sources.
 3. Crawl and process each source with summaries and embeddings.
-4. Build a relationship graph between the sources.
-5. Ask questions and get answers grounded in the notebook's source set.
+4. Build source-to-source relationships as a graph.
+5. Ask questions against the notebook's processed source base.
 
-## Why It Feels Hackathon-Friendly
+## Product Surface
 
-- Clear before/after story: one source becomes a navigable knowledge graph
-- Strong visual moment: the formation screen animates the notebook as sources are discovered and connected
-- Easy offline demo path: `?demo` mode runs without the backend
-- Flexible architecture: works in-memory for local prototyping and with Supabase/Redis for a fuller setup
+- Seed input for creating notebooks from URLs or raw text
+- Formation view showing notebook processing and graph assembly
+- Source panel for navigating collected materials
+- Graph view for exploring connections between sources
+- Chat panel for grounded follow-up questions
+- Demo mode for previewing the experience without backend services
 
-## Stack
+## Architecture
 
 - Frontend: React 19, Vite, Tailwind CSS 4, D3 force graph
 - Backend: FastAPI, Celery, Redis
-- AI: Gemini for title generation, source discovery, summarization, embeddings, and grounded answers
+- AI layer: Gemini for discovery, title generation, summarization, embeddings, and grounded answers
 - Crawling: `httpx`, `trafilatura`, optional Firecrawl fallback
 - Storage: in-memory repository by default, optional Supabase persistence
 
-## Repo Layout
+## Repository Layout
 
 ```text
 frontend/   React app, graph UI, chat panel, and demo mode
 backend/    FastAPI API, worker pipeline, crawling, retrieval, and graph logic
-docs/       Planning/spec notes from development
+docs/       Design notes and implementation plans
 ```
 
-## Quickstart
+## Getting Started
 
-### Option 1: Frontend-only demo mode
+### Quick Preview
 
-This is the fastest way to show the project without any API keys or backend services.
+To run the UI in demo mode without backend services or API keys:
 
 ```bash
 cd frontend
@@ -57,22 +77,18 @@ npm install
 npm run dev
 ```
 
-Then open:
+Open `http://localhost:5173/?demo`.
 
-```text
-http://localhost:5173/?demo
-```
-
-### Option 2: Full local app
+### Local Development
 
 #### Prerequisites
 
 - Node.js 20+
 - Python 3.11+
-- Redis if you want a separate Celery worker
-- Gemini API key for live AI-powered discovery and chat
-- Optional: Supabase credentials for persistence
-- Optional: Firecrawl API key for tougher crawling cases and PDFs
+- Redis if you want to run Celery as a separate worker
+- Gemini API key for live discovery, summarization, embeddings, and chat
+- Optional: Supabase credentials for persistent storage
+- Optional: Firecrawl API key for harder crawling cases and PDFs
 
 #### 1. Configure environment
 
@@ -80,11 +96,11 @@ http://localhost:5173/?demo
 cp .env.example .env
 ```
 
-Recommended local hackathon setup:
+Recommended local setup:
 
 - Set `GEMINI_API_KEY`
-- Leave `SUPABASE_URL` and `SUPABASE_KEY` blank to use in-memory storage
-- Keep `CELERY_TASK_ALWAYS_EAGER=true` if you want to avoid running a separate worker during local development
+- Leave `SUPABASE_URL` and `SUPABASE_KEY` blank to use the in-memory repository
+- Keep `CELERY_TASK_ALWAYS_EAGER=true` for a single-process setup, or set it to `false` and run a worker separately
 
 #### 2. Start the backend
 
@@ -98,9 +114,9 @@ PYTHONPATH=. uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 #### 3. Start the worker
 
-If `CELERY_TASK_ALWAYS_EAGER=true`, you can skip this step for quick local hacking.
+If `CELERY_TASK_ALWAYS_EAGER=true`, you can skip this step.
 
-If you want the full async pipeline:
+For the full async pipeline:
 
 ```bash
 cd backend
@@ -118,54 +134,34 @@ npm run dev
 
 The Vite dev server proxies `/api` requests to `http://localhost:8000`.
 
-## Environment Variables
+## Configuration
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | Yes for live AI features | Discovery, summaries, embeddings, chat answers |
-| `FIRECRAWL_API_KEY` | No | Better fallback crawling, especially for difficult pages and PDFs |
+| `GEMINI_API_KEY` | Yes for live AI features | Discovery, summaries, embeddings, and grounded chat |
+| `FIRECRAWL_API_KEY` | No | Improved fallback crawling, especially for difficult pages and PDFs |
 | `SUPABASE_URL` | No | Enables persistent storage instead of in-memory mode |
 | `SUPABASE_KEY` | No | Auth key for Supabase access |
 | `REDIS_URL` | No | Broker/backend for Celery, defaults to `redis://localhost:6379/0` |
 | `CELERY_TASK_ALWAYS_EAGER` | No | Runs notebook processing inline for a simpler local setup |
 | `CORS_ORIGINS` | No | Comma-separated allowed frontend origins |
 
-## API Surface
+## API
 
 - `POST /api/notebooks` creates a notebook from a seed URL or text
 - `GET /api/notebooks/:id` returns notebook state, sources, and edges
-- `POST /api/notebooks/:id/sources` adds extra sources
+- `POST /api/notebooks/:id/sources` adds additional sources
 - `GET /api/notebooks/:id/chat` returns chat history
 - `POST /api/notebooks/:id/chat` asks a grounded question against processed sources
 - `GET /api/health` reports app configuration status
 
-## How We Built It
+## Roadmap
 
-The backend pipeline processes notebooks in stages:
-
-1. Process the seed source
-2. Discover related sources with Gemini
-3. Crawl discovered pages concurrently
-4. Summarize and embed sources in parallel
-5. Build graph edges and relationship labels
-6. Use chunk-aware retrieval for grounded chat answers
-
-The frontend mirrors that journey with a formation screen, source list, graph view, and chat panel so users can understand what the notebook is doing in real time.
-
-## Challenges
-
-- Keeping the pipeline resilient when crawling quality varies across sites
-- Supporting a useful local mode with optional infrastructure
-- Making the graph feel alive enough for a demo, not just technically correct
-- Balancing fast hackathon UX with a backend architecture that can grow
-
-## What's Next
-
-- Better source filtering and ranking
-- Richer graph labels and clustering
-- Stronger persistence and collaboration features
-- Sharper citation UX inside answers
-- One-click deployment for public demos
+- Better source ranking and filtering
+- Richer graph labeling and clustering
+- Stronger persistence and collaboration workflows
+- Better citation visibility inside answers
+- Production deployment and hosted environments
 
 ## Security Note
 
