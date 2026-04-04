@@ -1,0 +1,41 @@
+## Secrets and local environment files
+.env
+.env.*
+!.env.example
+*.local
+
+## Node / frontend artifacts
+node_modules/
+frontend/node_modules/
+dist/
+build/
+coverage/
+.vite/
+frontend/.vite/
+
+## Python artifacts
+.venv/
+venv/
+backend/.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+backend/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+## Local tool state
+.claude/
+frontend/.claude/
+.superpowers/
+dump.rdb
+*.log
+*.pid
+
+## OS / editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
