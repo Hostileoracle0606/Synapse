@@ -1,0 +1,31 @@
+# Cloudflare Workers configuration for the Synapse frontend.
+#
+# Modern unified Workers + Static Assets model: a Worker hosts the
+# pre-built React bundle. No backend code runs on Cloudflare — the FastAPI
+# service lives elsewhere (your local machine, Fly.io, Render, etc.) and
+# the frontend reaches it via the absolute URL inlined at build time
+# from VITE_API_BASE.
+#
+# To deploy:
+#   1. (one-time) wrangler login
+#   2. VITE_API_BASE=https://your-backend.example.com npm run build
+#   3. npm run deploy
+#
+# To preview the deploy without actually pushing:
+#   npm run deploy:dry
+
+name = "synapse"
+compatibility_date = "2025-01-15"
+
+# `assets` mounts a directory of static files at the Worker's root path.
+# `single-page-application` rewrites unknown paths to /index.html so the
+# React Router-style client-side routing keeps working when a user
+# refreshes a deep link or arrives via a direct URL.
+[assets]
+directory = "./dist"
+not_found_handling = "single-page-application"
+
+# Observability: keep the request/response logs flowing to Cloudflare's
+# dashboard for easy debugging post-deploy.
+[observability]
+enabled = true

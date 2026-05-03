@@ -1,12 +1,14 @@
 import logging
 import sys
+import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 from app.config import get_settings
 from app.routers import chat, notebooks, sources
-from app.worker import celery_app
 
 # ── Logging setup ────────────────────────────────────────────────────────────
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -17,7 +19,7 @@ logging.basicConfig(
     format=_LOG_FORMAT,
     datefmt=_DATE_FORMAT,
     stream=sys.stdout,
-    force=True,  # override any prior basicConfig calls
+    force=True,
 )
 
 # Silence spammy third-party loggers, keep ours verbose
@@ -39,21 +41,15 @@ app.add_middleware(
 app.include_router(notebooks.router)
 app.include_router(sources.router)
 app.include_router(chat.router)
-import time
-
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 
 
 @app.on_event("startup")
 async def _on_startup():
     repo_type = "Supabase" if settings.has_supabase else "in-memory"
     logger.info(
-        "Synapse API starting — gemini=%s  repo=%s  redis=%s  embed_dim=%d  edge_threshold=%.2f",
+        "Synapse API starting — gemini_env_key=%s  repo=%s  edge_threshold=%.2f",
         settings.has_gemini,
         repo_type,
-        settings.redis_url,
-        settings.embedding_dimension,
         settings.edge_similarity_threshold,
     )
 
@@ -83,16 +79,10 @@ async def health():
         "services": {
             "gemini_configured": settings.has_gemini,
             "supabase_configured": settings.has_supabase,
-            "redis_url": settings.redis_url,
         },
     }
 
 
 @app.get("/health")
 async def health_simple():
-    try:
-        celery_app.control.ping(timeout=2.0)
-        celery_status = "ok"
-    except Exception:
-        celery_status = "unavailable"
-    return {"status": "ok", "celery": celery_status}
+    return {"status": "ok"}

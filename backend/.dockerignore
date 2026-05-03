@@ -1,0 +1,34 @@
+# Files we never want baked into the runtime image.
+# Each entry shaves seconds off `docker build` and keeps the image
+# from leaking local secrets / dev artifacts.
+
+# Python development residue
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# Local venv — would balloon the image and shadow the pip-installed deps
+.venv/
+venv/
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local secrets
+.env
+.env.local
+.env.*.local
+
+# Tests + dev tooling — runtime image doesn't need them
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Git history (the runtime doesn't need to know about commits)
+.git/
+.gitignore

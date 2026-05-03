@@ -13,6 +13,13 @@ coverage/
 .vite/
 frontend/.vite/
 
+## Wrangler / Cloudflare local cache (don't push the dryrun bundle or tmp)
+.wrangler/
+frontend/.wrangler/
+
+## Fly.io local state
+.fly/
+
 ## Python artifacts
 .venv/
 venv/

@@ -1,10 +1,10 @@
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
 from app.database import add_message, get_messages, get_notebook, get_sources
 from app.models import ChatMessage, ChatRequest
-from app.services.rag import generate_answer, retrieve_relevant_sources
+from app.services.rag import generate_answer
 
 router = APIRouter(prefix="/api/notebooks/{notebook_id}/chat", tags=["chat"])
 
@@ -20,7 +20,11 @@ async def get_chat_history(notebook_id: str):
 
 
 @router.post("", response_model=ChatMessage)
-async def send_message(notebook_id: str, req: ChatRequest):
+async def send_message(
+    notebook_id: str,
+    req: ChatRequest,
+    x_gemini_api_key: Optional[str] = Header(default=None, alias="X-Gemini-API-Key"),
+):
     notebook = await get_notebook(notebook_id)
     if not notebook:
         raise HTTPException(status_code=404, detail="Notebook not found")
@@ -32,7 +36,11 @@ async def send_message(notebook_id: str, req: ChatRequest):
         raise HTTPException(status_code=400, detail="No processed sources are ready yet")
 
     history = await get_messages(notebook_id)
-    relevant = await retrieve_relevant_sources(req.message, ready_sources, top_k=5)
-    answer = await generate_answer(req.message, relevant, history)
+    answer = await generate_answer(
+        req.message,
+        ready_sources,
+        history,
+        api_key=x_gemini_api_key,
+    )
     message = await add_message(notebook_id, "assistant", answer["content"], answer["sources_cited"])
     return ChatMessage(**message)

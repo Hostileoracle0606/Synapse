@@ -3,34 +3,62 @@ import * as d3 from "d3-force";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const SOURCE_COLORS = {
-  seed: "#A142F4",
-  webpage: "#4285F4",
-  pdf: "#EA4335",
+  seed: "#A142F4",      // purple
+  webpage: "#4285F4",   // blue
+  pdf: "#EA4335",       // red
+  youtube: "#fa7b17",   // orange
+  social: "#34a853",    // green
 };
 
-function getStageMetrics(sources) {
+// Friendly labels for the legend (capitalize / abbreviate types)
+const SOURCE_TYPE_LABELS = {
+  seed: "Seed",
+  webpage: "Web",
+  pdf: "PDF",
+  youtube: "Video",
+  social: "Social",
+};
+
+function getStageMetrics(sources, visibleIds = null) {
   const seedSource = sources.find((s) => s.source_type === "seed");
-  const discoveredSources = sources.filter((s) => s.source_type !== "seed");
+  // Errored sources are treated as if they don't exist — they don't appear
+  // in the sidebar, the formation status line ignores them, and the stage
+  // logic below treats them as "settled" so they don't block progression.
+  const discoveredSources = sources.filter(
+    (s) => s.source_type !== "seed" && s.status !== "error",
+  );
+
+  // visibleDiscoveredCount = how many discovered sources have actually
+  // popped into the graph yet (the stagger animation reveals them one at
+  // a time at 400ms intervals). Stage 2's progress bar follows this
+  // *visual* count, not the raw data count, so the bar finishes filling
+  // exactly when the last node lands on screen.
+  const visibleDiscoveredCount = visibleIds
+    ? discoveredSources.filter((s) => visibleIds.has(s.id)).length
+    : discoveredSources.length;
 
   return {
     seedReady: seedSource?.status === "ready",
     discoveredCount: discoveredSources.length,
+    visibleDiscoveredCount,
     discoveredReady: discoveredSources.filter((s) => s.status === "ready").length,
-    discoveredErrored: discoveredSources.filter((s) => s.status === "error").length,
     hasDiscovered: discoveredSources.length > 0,
-    allDiscoveredDone: discoveredSources.every((s) => s.status === "ready" || s.status === "error"),
+    allDiscoveredReady: discoveredSources.every((s) => s.status === "ready"),
     anyDiscoveredProcessing: discoveredSources.some((s) => s.status === "processing"),
     anyDiscoveredCrawling: discoveredSources.some((s) => s.status === "crawling"),
+    // Counts (not just booleans) so the stage-progress helper can compute
+    // a fractional fill for the vertical progress bars.
+    anyDiscoveredCrawlingCount: discoveredSources.filter((s) => s.status === "crawling").length,
+    anyDiscoveredProcessingCount: discoveredSources.filter((s) => s.status === "processing").length,
   };
 }
 
-export function computeStage(sources, edges) {
+export function computeStage(sources, _edges) {
   if (!sources.length) return 1;
 
   const {
     seedReady,
     hasDiscovered,
-    allDiscoveredDone,
     anyDiscoveredProcessing,
     anyDiscoveredCrawling,
   } = getStageMetrics(sources);
@@ -38,50 +66,153 @@ export function computeStage(sources, edges) {
   // Stage 1 — Seed still being processed.
   if (!seedReady) return 1;
 
-  // Stage 5 — All discovered sources settled, graph edges pending.
-  if (hasDiscovered && allDiscoveredDone && edges.length === 0) return 5;
-
-  // Stage 4 — Crawling finished; now summarising + embedding.
-  // Keep on stage 3 while any source is still being fetched (crawling overlaps
-  // with processing for concurrently-finished sources).
+  // Stage 4 — Analysing content (summarising). Edges are already computed
+  // by the keyword-overlap pass during this stage, so there's no separate
+  // "Building graph" stage anymore.
   if (anyDiscoveredProcessing && !anyDiscoveredCrawling) return 4;
 
-  // Stage 3 — Pages being fetched (covers the crawling+processing overlap too).
+  // Stage 3 — Pages being fetched (covers crawling+processing overlap too).
   if (anyDiscoveredCrawling) return 3;
 
-  // Stage 2 — Discovering sources, or discovered sources are queued but not crawling yet.
+  // Stage 2 — Discovering sources, or discovered sources queued.
+  if (hasDiscovered) return 2;
   if (seedReady) return 2;
 
   return 1;
 }
 
-export function statusLine(stage, sources, notebookStatus) {
-  const { discoveredCount, discoveredReady, discoveredErrored, hasDiscovered } = getStageMetrics(sources);
-  const errorSuffix = discoveredErrored > 0 ? ` (${discoveredErrored} failed)` : "";
-
-  if (notebookStatus === "error") {
-    return `Completed with ${discoveredReady} of ${discoveredCount} related sources · ${discoveredErrored} could not be fetched`;
-  }
+export function statusLine(stage, sources) {
+  const { discoveredCount, discoveredReady, hasDiscovered } = getStageMetrics(sources);
   switch (stage) {
-    case 1: return "Processing seed document…";
+    case 1:
+      return "Processing seed document…";
     case 2:
       return hasDiscovered
         ? `Found ${discoveredCount} related source${discoveredCount !== 1 ? "s" : ""}`
         : "Finding related sources…";
-    case 3: return `Crawling pages… ${discoveredReady} of ${discoveredCount - discoveredErrored} sources fetched${errorSuffix}`;
-    case 4: return `Analysing content… ${discoveredReady} of ${discoveredCount - discoveredErrored} sources ready${errorSuffix}`;
-    case 5: return "Building knowledge connections…";
-    default: return "";
+    case 3:
+      return `Reading sources… ${discoveredReady} of ${discoveredCount} ready`;
+    case 4:
+      return `Analysing content… ${discoveredReady} of ${discoveredCount} ready`;
+    default:
+      return "";
   }
 }
 
+// Returns 0-1, how far along a given stage is right now, derived from real
+// source-status counts. Status counts only update when the polling hook
+// brings fresh notebook state — so this signal is *discrete* (jumps when
+// counts change, flat in between). The StageTracker combines this with a
+// time-based baseline so the visible bar advances smoothly even when the
+// real signal is stuck.
+function stageProgress(stageNum, metrics) {
+  switch (stageNum) {
+    case 1:
+      return metrics.seedReady ? 1 : 0;
+    case 2:
+      // Sync to visual state: the bar fills as discovered nodes pop into
+      // the graph, not when the data first lands. Without this sync, the
+      // bar would snap to 100% at t=0 of discovery while nodes are still
+      // staggering in over the next 2-3 seconds. With the sync, bar fill
+      // and node appearance animate together.
+      if (!metrics.hasDiscovered) return 0;
+      if (metrics.discoveredCount === 0) return 0;
+      return Math.min(1, metrics.visibleDiscoveredCount / metrics.discoveredCount);
+    case 3:
+      if (metrics.discoveredCount === 0) return 0;
+      return Math.min(
+        1,
+        (metrics.discoveredReady +
+          metrics.anyDiscoveredCrawlingCount +
+          metrics.anyDiscoveredProcessingCount) /
+          metrics.discoveredCount,
+      );
+    case 4:
+      if (metrics.discoveredCount === 0) return 0;
+      return Math.min(1, metrics.discoveredReady / metrics.discoveredCount);
+    default:
+      return 0;
+  }
+}
+
+// Expected duration per stage in ms — used by the time-based baseline so
+// the bar always creeps even when status counts haven't ticked yet. These
+// are calibrated to the typical wall-clock observed during testing; the
+// bar just needs to feel-right, it doesn't have to be exact.
+const STAGE_EXPECTED_MS = {
+  1: 8000,    // seed crawl + summary ≈ 5–10s
+  2: 18000,   // discovery: one big Gemini grounded call ≈ 12–20s
+  3: 30000,   // reading: parallel crawls, dominated by slowest ≈ 20–40s
+  4: 25000,   // analysing: parallel summaries ≈ 15–30s
+};
+
+// Cap time-based interpolation at 92% so it never pre-empts the moment
+// when a stage actually completes. The "snap to 100%" transition is what
+// makes completion feel definite.
+const TIME_PROGRESS_CEILING = 0.92;
+
 function StageTracker({ currentStage, highestStage, metrics }) {
+  // Track the wall-clock moment each stage first becomes active. Used to
+  // compute time-based progress (the baseline that creeps the bar between
+  // status updates so it feels real-time instead of jumping in chunks).
+  const stageStartRef = useRef({});
+  const [now, setNow] = useState(() => Date.now());
+
+  // Tick at 10Hz to redraw the bar smoothly while waiting on backend events.
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 100);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Mark stage start time the first time we see a stage become active.
+  useEffect(() => {
+    if (currentStage && !stageStartRef.current[currentStage]) {
+      stageStartRef.current[currentStage] = Date.now();
+    }
+  }, [currentStage]);
+
+  // Time-based progress for a stage: 0 if the stage hasn't started, capped
+  // at TIME_PROGRESS_CEILING (92%) regardless of elapsed time so the bar
+  // can't pretend to be done before it actually is.
+  const timeProgress = (stageNum) => {
+    const startTime = stageStartRef.current[stageNum];
+    if (!startTime) return 0;
+    const expected = STAGE_EXPECTED_MS[stageNum] || 10000;
+    const elapsed = now - startTime;
+    return Math.min(TIME_PROGRESS_CEILING, elapsed / expected);
+  };
+
+  // Combined progress: real status-derived progress wins when it leads;
+  // time-based baseline keeps the bar moving when status hasn't ticked.
+  const combinedProgress = (stageNum) => {
+    const real = stageProgress(stageNum, metrics);
+    const timed = timeProgress(stageNum);
+    // If the real signal has hit 100%, snap immediately — that's the
+    // definitive completion moment. Otherwise pick whichever is higher.
+    if (real >= 1) return 1;
+    return Math.max(real, timed);
+  };
+
+  // Four stages, no "Building graph" — keyword-overlap edges land alongside
+  // the analysis pass, so a separate graph-building step would just flash on
+  // screen for milliseconds.
   const stages = [
     { title: "Processing seed", desc: "Parsing initial document" },
-    { title: "Sources identified", desc: metrics.discoveredCount > 0 ? `Found ${metrics.discoveredCount} related sources` : "Searching web…" },
-    { title: "Crawling pages", desc: metrics.discoveredReady > 0 ? `Crawled ${metrics.discoveredReady} pages` : "Pending" },
-    { title: "Analysing content", desc: "Extracting concepts" },
-    { title: "Building graph", desc: "Mapping relationships" },
+    {
+      title: "Sources identified",
+      desc:
+        metrics.discoveredCount > 0
+          ? `Found ${metrics.discoveredCount} related sources`
+          : "Searching web…",
+    },
+    {
+      title: "Reading sources",
+      desc:
+        metrics.discoveredReady > 0
+          ? `Read ${metrics.discoveredReady} of ${metrics.discoveredCount}`
+          : "Pending",
+    },
+    { title: "Analysing content", desc: "Extracting concepts and relationships" },
   ];
 
   return (
@@ -91,11 +222,29 @@ function StageTracker({ currentStage, highestStage, metrics }) {
         const active = stageNum === currentStage;
         const isDone = stageNum < currentStage;
 
+        // Progress that fills the connector AFTER this stage's bullet.
+        // Past stages = 100%, future = 0%, active = live (combinedProgress
+        // blends real status-derived progress with a time-based baseline so
+        // the bar advances smoothly even when no source statuses change).
+        let connectorProgress = 0;
+        if (isDone) connectorProgress = 1;
+        else if (active) connectorProgress = combinedProgress(stageNum);
+
         return (
           <div key={stageNum} className="relative flex flex-1">
-            {/* The line connector */}
+            {/* Vertical connector — now a real progress bar. The grey track
+                is full-height; the green fill grows from the top down as
+                the active stage advances. */}
             {i !== stages.length - 1 && (
-              <div className={`absolute left-[11px] top-[28px] bottom-0 w-[2px] ${isDone ? "bg-[#34a853]" : "bg-[#f0f4f9]"}`} />
+              <div className="absolute left-[11px] top-[28px] bottom-0 w-[2px] overflow-hidden rounded-full bg-[#f0f4f9]">
+                <div
+                  className="absolute left-0 right-0 top-0 bg-[#34a853]"
+                  style={{
+                    height: `${connectorProgress * 100}%`,
+                    transition: "height 600ms cubic-bezier(0.22, 1, 0.36, 1)",
+                  }}
+                />
+              </div>
             )}
 
             <div className="flex w-full items-start gap-4 pb-4">
@@ -143,6 +292,17 @@ function useSize(ref) {
 
 export default function FormationScreen({ notebook, sources, edges, onReady }) {
   const wrapRef = useRef(null);
+  // Track whether we're at the lg+ breakpoint so the stage-tracker
+  // closing animation can pick the right axis (width on desktop, height
+  // on mobile where the layout stacks).
+  const [isLargeViewport, setIsLargeViewport] = useState(
+    typeof window !== "undefined" && window.innerWidth >= 1024,
+  );
+  useEffect(() => {
+    const update = () => setIsLargeViewport(window.innerWidth >= 1024);
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
   const simulationRef = useRef(null);
   const liveNodeMapRef = useRef(new Map());
   const enteringNodeIds = useRef(new Set());
@@ -151,8 +311,12 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
   const size = useSize(wrapRef);
 
   const [highestStage, setHighestStage] = useState(1);
-  const [doneOverlay, setDoneOverlay] = useState(false);
-  const [doneOverlayOpacity, setDoneOverlayOpacity] = useState(0);
+  // isCompleting is set to true when the notebook hits ready/error. It
+  // triggers the closing choreography (sweeps fade out, edges pulse, the
+  // ready strip slides up from the bottom). The strip remains visible
+  // until App.jsx swaps to the main view, so we don't auto-clear it.
+  const [isCompleting, setIsCompleting] = useState(false);
+  const [readyStripVisible, setReadyStripVisible] = useState(false);
   const readyFiredRef = useRef(false);
 
   const currentStage = useMemo(() => computeStage(sources, edges), [sources, edges]);
@@ -162,7 +326,14 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
     setHighestStage((prev) => Math.max(prev, currentStage));
   }, [currentStage]);
 
-  // Trigger "done" moment
+  // Closing choreography. Triggered exactly once when the notebook flips
+  // to ready/error.
+  //
+  //   t=0      sweeps start fading out, simulation cools, edges thicken
+  //   t=400    ready strip mounts; one frame later we toggle visibility
+  //            so the slide-up + fade-in transition fires
+  //   App.jsx waits 1.8s before unmounting FormationScreen, so the strip
+  //   gets ~1.4s of "look at me" time before the main view appears.
   useEffect(() => {
     if ((notebook?.status === "ready" || notebook?.status === "error") && !readyFiredRef.current) {
       readyFiredRef.current = true;
@@ -174,15 +345,19 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
       );
       onReady?.(positions);
 
-      setDoneOverlay(true);
-      requestAnimationFrame(() => setDoneOverlayOpacity(1));
+      // Cool the d3 simulation — let nodes settle into final positions.
+      if (simulationRef.current) {
+        try {
+          simulationRef.current.alphaTarget(0).alpha(0).stop();
+        } catch {
+          // simulation may already be stopped; ignore
+        }
+      }
 
-      setTimeout(() => {
-        setDoneOverlayOpacity(0);
-      }, 1800);
-      setTimeout(() => {
-        setDoneOverlay(false);
-      }, 2400);
+      setIsCompleting(true);
+      window.setTimeout(() => {
+        setReadyStripVisible(true);
+      }, 400);
     }
   }, [notebook?.status, onReady]);
 
@@ -196,6 +371,16 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
       .filter((id) => !staggerVisibleIds.has(id));
 
     if (newlyVisible.length > 0) {
+      // Cap the *total* stagger window at ~2s regardless of how many
+      // nodes are entering. With 12 sources the old 400ms-each stagger
+      // pushed the last node 4.8s into the future, leaving Stage 2's
+      // (now visual-state-synced) progress bar dragging far behind the
+      // actual discovery moment. 2s feels like the goldilocks zone:
+      // long enough to read as "they're coming in one at a time," short
+      // enough that the bar reaches 100% while discovery still feels
+      // recent.
+      const TOTAL_STAGGER_MS = 2000;
+      const perItemMs = Math.min(400, TOTAL_STAGGER_MS / newlyVisible.length);
       newlyVisible.forEach((id, index) => {
         setTimeout(() => {
           setStaggerVisibleIds((prev) => {
@@ -203,14 +388,16 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
             next.add(id);
             return next;
           });
-        }, index * 400); // 400ms stagger
+        }, index * perItemMs);
       });
     }
   }, [sources, staggerVisibleIds]);
 
   const { nodes, links } = useMemo(() => {
     const visibleSources = sources.filter(
-      (s) => staggerVisibleIds.has(s.id)
+      // Hide errored sources completely — never let them render as orphan
+      // dots in the graph. Matches the same filter in DocumentWeb / SourcesPanel.
+      (s) => staggerVisibleIds.has(s.id) && s.status !== "error",
     );
     const graphNodes = visibleSources.map((source, index) => ({
       id: source.id,
@@ -354,6 +541,74 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
   const totalSources = sources.length;
   const totalEdges = edges.length;
 
+  // Auto-fit viewBox: compute the bounding box of currently-rendered nodes
+  // and animate the SVG's user-coordinate window to wrap them with padding.
+  // The simulation runs in raw pixel coords centred near (size.width/2,
+  // size.height/2); without this, nodes that the force layout pushes outside
+  // that window get clipped by the SVG viewport.
+  const VIEWBOX_PADDING = 60;
+  const VIEWBOX_LABEL_PAD = 30; // for the text label below each node
+  const VIEWBOX_MIN_SIZE = 480;
+  const VIEWBOX_LERP = 0.18; // 0=no movement, 1=instant snap
+
+  const [viewBox, setViewBox] = useState(null);
+
+  useEffect(() => {
+    if (!size.width || !size.height) return;
+    const nodeArr = Array.from(liveNodeMapRef.current.values());
+    if (!nodeArr.length) {
+      // No nodes yet — match the container's pixel size as the initial frame.
+      setViewBox((prev) => prev || { x: 0, y: 0, w: size.width, h: size.height });
+      return;
+    }
+
+    // Tight bbox around all nodes (radius + label space included).
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of nodeArr) {
+      const x = n.x ?? size.width / 2;
+      const y = n.y ?? size.height / 2;
+      minX = Math.min(minX, x - n.r - 8);
+      maxX = Math.max(maxX, x + n.r + 8);
+      minY = Math.min(minY, y - n.r - 8);
+      maxY = Math.max(maxY, y + n.r + VIEWBOX_LABEL_PAD);
+    }
+
+    let contentW = (maxX - minX) + VIEWBOX_PADDING * 2;
+    let contentH = (maxY - minY) + VIEWBOX_PADDING * 2;
+    contentW = Math.max(contentW, VIEWBOX_MIN_SIZE);
+    contentH = Math.max(contentH, VIEWBOX_MIN_SIZE);
+
+    // Maintain the container's aspect ratio so SVG doesn't squash content.
+    const containerAspect = size.width / size.height;
+    const contentAspect = contentW / contentH;
+    if (contentAspect > containerAspect) {
+      contentH = contentW / containerAspect;
+    } else {
+      contentW = contentH * containerAspect;
+    }
+
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    const target = {
+      x: cx - contentW / 2,
+      y: cy - contentH / 2,
+      w: contentW,
+      h: contentH,
+    };
+
+    setViewBox((prev) => {
+      if (!prev) return target;
+      // Damped lerp toward target — produces a smooth zoom-out as new nodes
+      // appear at the periphery.
+      return {
+        x: prev.x + (target.x - prev.x) * VIEWBOX_LERP,
+        y: prev.y + (target.y - prev.y) * VIEWBOX_LERP,
+        w: prev.w + (target.w - prev.w) * VIEWBOX_LERP,
+        h: prev.h + (target.h - prev.h) * VIEWBOX_LERP,
+      };
+    });
+  }, [tick, size.width, size.height]);
+
   // Ghost edges: nearest-neighbour connections between ready nodes, rendered as
   // animated dashed lines to suggest computation before real edges arrive at t=17s.
   const ghostLinks = useMemo(() => {
@@ -397,27 +652,57 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
 
       {/* Main area */}
       <main className="flex flex-1 flex-col gap-4 px-4 pb-4 lg:flex-row min-h-0 overflow-hidden">
-        {/* Stage tracker Panel */}
-        <div className="flex w-full flex-col rounded-[2rem] border border-[#e0e2e0] bg-white shadow-sm lg:w-[340px] shrink-0 px-8 py-7">
-          <p className="mb-8 flex items-center gap-2 text-base font-medium text-[#1f1f1f]">
-            <Sparkles className="h-5 w-5 text-[#0b57d0]" />
+        {/* Stage tracker Panel — recedes leftward (width → 0) once the
+            notebook hits ready, so the graph panel can grow to fill the
+            row before the App swaps to the main view. */}
+        <div
+          className="flex w-full flex-col overflow-hidden rounded-[2rem] border border-[#e0e2e0] bg-white shadow-sm shrink-0 px-8 py-7 lg:w-[340px]"
+          style={{
+            // While completing, animate width → 0 (lg+) or maxHeight → 0
+            // (mobile). When not completing, leave inline width undefined
+            // so the Tailwind `lg:w-[340px]` / `w-full` classes take over.
+            width: isCompleting && isLargeViewport ? 0 : undefined,
+            maxHeight: isCompleting && !isLargeViewport ? 0 : undefined,
+            paddingLeft: isCompleting ? 0 : undefined,
+            paddingRight: isCompleting ? 0 : undefined,
+            paddingTop: isCompleting ? 0 : undefined,
+            paddingBottom: isCompleting ? 0 : undefined,
+            opacity: isCompleting ? 0 : 1,
+            transition:
+              "width 600ms cubic-bezier(0.22, 1, 0.36, 1), max-height 600ms cubic-bezier(0.22, 1, 0.36, 1), padding 600ms cubic-bezier(0.22, 1, 0.36, 1), opacity 400ms ease-out",
+          }}
+        >
+          <p className="mb-8 flex items-center gap-2 text-base font-medium text-[#1f1f1f] whitespace-nowrap">
+            <Sparkles className="h-5 w-5 text-[#0b57d0] shrink-0" />
             Discovery Process
           </p>
           <div className="flex-1 overflow-y-auto no-scrollbar min-h-0">
-            <StageTracker currentStage={displayStage} highestStage={highestStage} metrics={getStageMetrics(sources)} />
+            <StageTracker
+              currentStage={displayStage}
+              highestStage={highestStage}
+              metrics={getStageMetrics(sources, staggerVisibleIds)}
+            />
           </div>
         </div>
 
         {/* Graph area Panel */}
         <div ref={wrapRef} className="relative flex-1 rounded-[2rem] border border-[#e0e2e0] bg-white shadow-sm overflow-hidden">
           {size.width > 0 && (
-            <svg className="h-full w-full">
+            <svg
+              className="h-full w-full"
+              viewBox={
+                viewBox
+                  ? `${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`
+                  : `0 0 ${size.width} ${size.height}`
+              }
+              preserveAspectRatio="xMidYMid meet"
+            >
               <defs>
                 <filter id="formation-shadow" x="-20%" y="-20%" width="140%" height="140%">
                   <feDropShadow dx="0" dy="2" stdDeviation="3" floodOpacity="0.12" />
                 </filter>
               </defs>
-              <g>
+              <g className={isCompleting ? "graph-completing" : ""}>
                 {/* Ghost edges — animated dashed lines between ready nodes before real edges exist */}
                 {ghostLinks.map(({ key, ax, ay, bx, by }) => (
                   <line
@@ -458,24 +743,102 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
                 {Array.from(liveNodeMap.values()).map((node) => {
                   const color = SOURCE_COLORS[node.source_type] || SOURCE_COLORS.webpage;
                   const isEntering = enteringNodeIds.current.has(node.id);
+                  const isSeed = node.source_type === "seed";
+                  const isReady = node.status === "ready" || isSeed;
+                  const isAnalyzing = node.status === "processing";
+                  const isFetching = node.status === "crawling";
+
+                  // The buffering circle is now drawn around EVERY non-seed
+                  // node throughout the formation, not just the one being
+                  // fetched right now. Speed and opacity vary slightly by
+                  // status so the eye still picks out which one is "active":
+                  //   crawling/processing → faster, higher contrast sweep
+                  //   pending or ready    → slower, fainter ambient sweep
+                  // Once the whole notebook is ready (notebook.status flips),
+                  // the formation screen unmounts and the sweeps go away.
+                  const showSweep = !isSeed;
+                  const sweepIsActive = isFetching || isAnalyzing;
+
+                  // Node visual state classes:
+                  //   .node-entering — pop-in scale animation when first added
+                  //   .node-fetching — slow pulse while content is being fetched
+                  //   .node-analyzing — faster pulse + halo while summarising
+                  const cls = [
+                    isEntering ? "node-entering" : "",
+                    isFetching ? "node-fetching" : "",
+                    isAnalyzing ? "node-analyzing" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ");
+
+                  // Reading sweep: a 90° arc that rotates around the node.
+                  // Built from a stroke-dasharray pattern (short visible
+                  // segment, long invisible gap) on a circle slightly larger
+                  // than the node. transform-box: fill-box pivots the
+                  // rotation around the circle's own center.
+                  const sweepRadius = node.r + 5;
+                  const sweepCircumference = 2 * Math.PI * sweepRadius;
+                  const sweepArcLength = sweepCircumference * 0.22;
 
                   return (
                     <g
                       key={node.id}
-                      className={isEntering ? "node-entering" : ""}
+                      className={cls}
                       style={{ transformOrigin: `${node.x}px ${node.y}px` }}
                     >
+                      {/* Buffering sweep — visible on every non-seed node
+                          while the formation is in progress. Active sources
+                          get a brighter, faster sweep; pending and ready
+                          sources still get an ambient slow sweep so the
+                          whole graph reads as "still forming". */}
+                      {showSweep && (
+                        <circle
+                          cx={node.x}
+                          cy={node.y}
+                          r={sweepRadius}
+                          fill="none"
+                          stroke={color}
+                          strokeWidth={sweepIsActive ? 2.5 : 2}
+                          strokeOpacity={sweepIsActive ? 0.9 : 0.45}
+                          strokeLinecap="round"
+                          strokeDasharray={`${sweepArcLength} ${sweepCircumference - sweepArcLength}`}
+                          className={sweepIsActive ? "reading-sweep reading-sweep-fast" : "reading-sweep reading-sweep-slow"}
+                          style={{
+                            transformBox: "fill-box",
+                            transformOrigin: "center",
+                          }}
+                        />
+                      )}
+
+                      {/* Halo: rendered behind the main circle, only visible
+                          while a node is in the analyzing state. Soft pulse
+                          to draw the eye to active processing. */}
+                      {isAnalyzing && (
+                        <circle
+                          cx={node.x}
+                          cy={node.y}
+                          r={node.r + 6}
+                          fill={color}
+                          fillOpacity={0.18}
+                          className="node-halo"
+                        />
+                      )}
                       <circle
-                        cx={node.x} cy={node.y} r={node.r}
+                        cx={node.x}
+                        cy={node.y}
+                        r={node.r}
                         fill={color}
-                        fillOpacity={node.status === "ready" || node.source_type === "seed" ? 0.96 : 0.58}
+                        fillOpacity={isReady ? 0.96 : 0.58}
                         stroke="#ffffff"
                         strokeWidth={2}
                         filter="url(#formation-shadow)"
                       />
                       <text
-                        x={node.x} y={node.y + node.r + 16}
-                        textAnchor="middle" fontSize="11" fill="#1f1f1f"
+                        x={node.x}
+                        y={node.y + node.r + 16}
+                        textAnchor="middle"
+                        fontSize="11"
+                        fill="#1f1f1f"
                         style={{ pointerEvents: "none" }}
                       >
                         {node.title.length > 24 ? `${node.title.slice(0, 22)}…` : node.title}
@@ -487,47 +850,146 @@ export default function FormationScreen({ notebook, sources, edges, onReady }) {
             </svg>
           )}
 
-          {/* Color legend */}
-          <div className="absolute bottom-6 left-6 flex items-center gap-4">
-            {Object.entries(SOURCE_COLORS).map(([type, color]) => (
-              <div key={type} className="flex items-center gap-1.5">
-                <div className="h-3 w-3 rounded-full" style={{ backgroundColor: color }} />
-                <span className="text-xs capitalize text-[#5f6368]">{type}</span>
+          {/* Color legend — pill-shaped overlay so it pops against the
+              white panel. Only renders types actually present in this
+              notebook so it doesn't get crowded. */}
+          {(() => {
+            const presentTypes = new Set(
+              sources.filter((s) => s.status !== "error").map((s) => s.source_type),
+            );
+            const items = Object.entries(SOURCE_COLORS).filter(([type]) =>
+              presentTypes.has(type),
+            );
+            if (items.length === 0) return null;
+            return (
+              <div className="absolute bottom-6 left-6 z-10 flex items-center gap-3 rounded-full border border-[#e0e2e0] bg-white/85 px-4 py-1.5 shadow-sm backdrop-blur">
+                {items.map(([type, color]) => (
+                  <span
+                    key={type}
+                    className="flex items-center gap-1.5 text-xs text-[#5f6368]"
+                  >
+                    <span
+                      className="h-2 w-2 rounded-full"
+                      style={{ backgroundColor: color }}
+                    />
+                    {SOURCE_TYPE_LABELS[type] || type}
+                  </span>
+                ))}
               </div>
-            ))}
-          </div>
-
-          {/* Live status line */}
-          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 text-sm text-[#5f6368]">
-            {statusLine(displayStage, sources, notebook?.status)}
-          </div>
+            );
+          })()}
 
           <style>{`
             @keyframes ghost-march { to { stroke-dashoffset: -26; } }
             .ghost-edge { animation: ghost-march 1.4s linear infinite; }
+
+            /* Reading-sweep: a partial arc rotates around each non-seed
+               node, suggesting "still being read / connected". Two speeds:
+               a brisk active sweep for sources currently being fetched or
+               analysed, and a slower ambient sweep for everything else
+               (pending or ready). transform-box: fill-box anchors the
+               rotation to the circle's own center. */
+            @keyframes reading-sweep {
+              to { transform: rotate(360deg); }
+            }
+            .reading-sweep-fast {
+              animation: reading-sweep 1.4s linear infinite;
+            }
+            .reading-sweep-slow {
+              animation: reading-sweep 3.4s linear infinite;
+            }
+
+            /* Subtle dim on the main circle while fetching, so the bright
+               arc above it stands out — but kept gentler than before so
+               it doesn't compete with the sweep. */
+            @keyframes node-fetch-pulse {
+              0%, 100% { opacity: 0.62; }
+              50%      { opacity: 0.82; }
+            }
+            .node-fetching > circle:not(.reading-sweep) {
+              animation: node-fetch-pulse 1.6s ease-in-out infinite;
+            }
+
+            @keyframes node-analyze-pulse {
+              0%, 100% { opacity: 0.62; }
+              50%      { opacity: 0.95; }
+            }
+            .node-analyzing > circle:not(.node-halo) { animation: node-analyze-pulse 1.0s ease-in-out infinite; }
+
+            @keyframes node-halo-grow {
+              0%, 100% { opacity: 0.05; transform-origin: center; }
+              50%      { opacity: 0.32; }
+            }
+            .node-halo { animation: node-halo-grow 1.4s ease-in-out infinite; }
+
+            /* Closing choreography. When .graph-completing is on the root
+               group:
+                 - all reading-sweep arcs fade out over 600ms
+                 - all halos retract
+                 - edge lines briefly thicken (a "the connections are now
+                   meaningful" pulse) then settle. */
+            .graph-completing .reading-sweep-fast,
+            .graph-completing .reading-sweep-slow {
+              animation-play-state: paused;
+              opacity: 0;
+              transition: opacity 600ms ease-out;
+            }
+            .graph-completing .node-halo {
+              animation-play-state: paused;
+              opacity: 0;
+              transition: opacity 600ms ease-out;
+            }
+            @keyframes graph-edge-pulse {
+              0%   { stroke-width: 1; }
+              50%  { stroke-width: 2.6; }
+              100% { stroke-width: 1; }
+            }
+            .graph-completing line:not(.ghost-edge) {
+              animation: graph-edge-pulse 700ms ease-in-out 1;
+            }
           `}</style>
 
-          {/* "Done" overlay */}
-          {doneOverlay && (
-            <div
-              className="pointer-events-none absolute inset-0 flex items-center justify-center"
-              style={{ opacity: doneOverlayOpacity, transition: "opacity 300ms ease" }}
-            >
-              <div className="rounded-[2rem] border border-[#e0e2e0] bg-white/90 px-10 py-7 text-center shadow-lg backdrop-blur">
-                <div className="mb-2 flex items-center justify-center gap-2 text-[#0b57d0]">
-                  <Sparkles className="h-5 w-5" />
-                  <span className="text-lg font-medium text-[#1f1f1f]">
-                    {notebook?.status === "error" ? "Ready with partial sources" : "Knowledge graph ready"}
+          {/* Ready strip — anchored to the bottom of the graph panel
+              (rather than the previous centered overlay that covered the
+              nodes). The gradient above it fades node labels softly into
+              the strip's background instead of clipping them. */}
+          {isCompleting && (
+            <>
+              {/* Soft fade above the strip so node labels near the bottom
+                  of the canvas don't visually cut through the edge of the
+                  ready card. */}
+              <div
+                className="pointer-events-none absolute bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-white via-white/85 to-transparent"
+                style={{
+                  opacity: readyStripVisible ? 1 : 0,
+                  transition: "opacity 400ms ease-out",
+                }}
+              />
+              <div
+                className="pointer-events-none absolute bottom-5 left-1/2 -translate-x-1/2 transform"
+                style={{
+                  transform: readyStripVisible
+                    ? "translate(-50%, 0)"
+                    : "translate(-50%, 16px)",
+                  opacity: readyStripVisible ? 1 : 0,
+                  transition: "transform 460ms cubic-bezier(0.22, 1, 0.36, 1), opacity 400ms ease-out",
+                }}
+              >
+                <div className="flex items-center gap-3 rounded-full border border-[#e0e2e0] bg-white px-5 py-2.5 shadow-md">
+                  <Sparkles className="h-4 w-4 text-[#0b57d0]" />
+                  <span className="text-sm font-medium text-[#1f1f1f]">
+                    Knowledge graph ready
+                  </span>
+                  <span className="text-sm text-[#5f6368]">
+                    · {sources.filter((s) => s.status === "ready").length} source
+                    {sources.filter((s) => s.status === "ready").length !== 1 ? "s" : ""}
+                    {totalEdges > 0
+                      ? ` · ${totalEdges} connection${totalEdges !== 1 ? "s" : ""}`
+                      : ""}
                   </span>
                 </div>
-                <p className="text-sm text-[#5f6368]">
-                  {sources.filter(s => s.status === "ready").length} source{totalSources !== 1 ? "s" : ""} ready
-                  {notebook?.status === "error" && sources.some(s => s.status === "error")
-                    ? ` · ${sources.filter(s => s.status === "error").length} failed`
-                    : totalEdges > 0 ? ` · ${totalEdges} connection${totalEdges !== 1 ? "s" : ""}` : ""}
-                </p>
               </div>
-            </div>
+            </>
           )}
         </div>
       </main>

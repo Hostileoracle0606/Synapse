@@ -2,12 +2,20 @@ import { Crosshair, Minus, Plus, RotateCcw, Sparkles } from "lucide-react";
 import * as d3 from "d3-force";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import NodePopover from "./NodePopover";
-
 const SOURCE_COLORS = {
-  seed: "#A142F4",
-  webpage: "#4285F4",
-  pdf: "#EA4335",
+  seed: "#A142F4",      // purple
+  webpage: "#4285F4",   // blue
+  pdf: "#EA4335",       // red
+  youtube: "#fa7b17",   // orange
+  social: "#34a853",    // green
+};
+
+const SOURCE_TYPE_LABELS = {
+  seed: "Seed",
+  webpage: "Web",
+  pdf: "PDF",
+  youtube: "Video",
+  social: "Social",
 };
 
 function sourceTone(status) {
@@ -37,7 +45,14 @@ function useSize(ref) {
   return size;
 }
 
-export default function DocumentWeb({ sources, edges, selectedSource, onSelectSource, initialNodePositions }) {
+export default function DocumentWeb({
+  sources,
+  edges,
+  selectedSource,
+  onSelectSource,
+  initialNodePositions,
+  citedSourceIds,
+}) {
   const wrapRef = useRef(null);
   const simulationRef = useRef(null);
   const liveNodeMapRef = useRef(new Map());
@@ -52,7 +67,10 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
   const dragState = useRef(null); // { startX, startY, startTX, startTY }
 
   const { nodes, links } = useMemo(() => {
-    const graphNodes = sources.map((source, index) => ({
+    // Errored sources are hidden everywhere in the UI. If we let them through
+    // here they'd render as disconnected orphan dots in the graph.
+    const visibleSources = sources.filter((s) => s.status !== "error");
+    const graphNodes = visibleSources.map((source, index) => ({
       id: source.id,
       title: source.title?.startsWith("http") ? "Article header" : source.title,
       summary: source.summary,
@@ -87,6 +105,16 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
     });
     return set;
   }, [selectedSource, links]);
+
+  // Set of cited source ids from the latest assistant chat response.
+  // While this is populated, the graph dims non-cited nodes and lights up
+  // cited ones with a soft halo — replacing the old "Cited sources" pill
+  // list under each chat message. A user click on any node still wins
+  // (selection takes precedence over citation highlight).
+  const citedNodeIds = useMemo(() => {
+    if (!citedSourceIds || citedSourceIds.length === 0) return null;
+    return new Set(citedSourceIds);
+  }, [citedSourceIds]);
 
   // Create simulation ONCE on mount
   useEffect(() => {
@@ -175,9 +203,15 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
     simulation.nodes(updatedNodeList);
     simulation.force("link").links(links);
 
-    // If we have pre-positioned nodes from formation, start frozen
+    // If we have pre-positioned nodes from formation, start frozen — but
+    // populate liveNodeMap *now* since the simulation won't tick. Skipping
+    // this step leaves the render loop with an empty map → no nodes drawn.
     if (initialNodePositions && addedNodes.every((n) => initialNodePositions.has(n.id))) {
+      const liveMap = new Map();
+      updatedNodeList.forEach((n) => liveMap.set(n.id, n));
+      liveNodeMapRef.current = liveMap;
       simulation.alpha(0).stop();
+      setTick((v) => v + 1);
     } else {
       simulation.alpha(0.3).restart();
     }
@@ -270,15 +304,28 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
         </h2>
       </div>
 
-      {/* Node type legend — bottom-left */}
-      <div className="absolute bottom-6 left-6 z-10 flex items-center gap-3 rounded-full border border-[#e0e2e0] bg-white/80 px-4 py-1.5 shadow-sm backdrop-blur">
-        {Object.entries(SOURCE_COLORS).map(([type, color]) => (
-          <span key={type} className="flex items-center gap-1.5 text-xs text-[#5f6368]">
-            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
-            {type === "pdf" ? "PDF" : type.charAt(0).toUpperCase() + type.slice(1)}
-          </span>
-        ))}
-      </div>
+      {/* Node type legend — only shows colors actually present in this notebook. */}
+      {(() => {
+        const presentTypes = new Set(
+          (sources || [])
+            .filter((s) => s.status !== "error")
+            .map((s) => s.source_type),
+        );
+        const items = Object.entries(SOURCE_COLORS).filter(([type]) =>
+          presentTypes.has(type),
+        );
+        if (items.length === 0) return null;
+        return (
+          <div className="absolute bottom-6 left-6 z-10 flex items-center gap-3 rounded-full border border-[#e0e2e0] bg-white/80 px-4 py-1.5 shadow-sm backdrop-blur">
+            {items.map(([type, color]) => (
+              <span key={type} className="flex items-center gap-1.5 text-xs text-[#5f6368]">
+                <span className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
+                {SOURCE_TYPE_LABELS[type] || type}
+              </span>
+            ))}
+          </div>
+        );
+      })()}
 
       <div
         ref={wrapRef}
@@ -320,9 +367,21 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
                   (connectedNodeIds.has(srcId) && connectedNodeIds.has(tgtId)) ||
                   srcId === selectedSource?.id ||
                   tgtId === selectedSource?.id;
-                const edgeOpacity = connectedNodeIds
-                  ? isConnected ? (0.22 + sim * 0.5) : 0.06
-                  : (0.22 + sim * 0.5);
+
+                // Edge dimming logic, in priority order:
+                //   1. user has selected a source → standard neighbourhood dim
+                //   2. chat returned citations → only edges between cited
+                //      nodes stay bright; everything else fades back
+                //   3. otherwise → default opacity tied to similarity
+                let edgeOpacity;
+                if (connectedNodeIds) {
+                  edgeOpacity = isConnected ? (0.22 + sim * 0.5) : 0.06;
+                } else if (citedNodeIds) {
+                  const bothCited = citedNodeIds.has(srcId) && citedNodeIds.has(tgtId);
+                  edgeOpacity = bothCited ? (0.45 + sim * 0.4) : 0.06;
+                } else {
+                  edgeOpacity = (0.22 + sim * 0.5);
+                }
 
                 return (
                   <line
@@ -368,11 +427,22 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
               {/* Nodes */}
               {Array.from(liveNodeMap.values()).map((node) => {
                 const isSelected = selectedSource?.id === node.id;
+                const isCited = citedNodeIds?.has(node.id) || false;
                 const color = SOURCE_COLORS[node.source_type] || SOURCE_COLORS.webpage;
                 const label = node.title.length > 24 ? `${node.title.slice(0, 22)}...` : node.title;
-                const nodeOpacity = connectedNodeIds
-                  ? isSelected || connectedNodeIds.has(node.id) ? 0.96 : 0.18
-                  : (node.status === "ready" || node.source_type === "seed" ? 0.96 : 0.58);
+
+                // Node opacity, in the same priority order as edges:
+                //   1. user-selected source — standard neighbourhood
+                //   2. chat citation set — cited nodes bright, rest dim
+                //   3. default — full opacity for ready / seed
+                let nodeOpacity;
+                if (connectedNodeIds) {
+                  nodeOpacity = isSelected || connectedNodeIds.has(node.id) ? 0.96 : 0.18;
+                } else if (citedNodeIds) {
+                  nodeOpacity = isCited ? 1.0 : 0.22;
+                } else {
+                  nodeOpacity = node.status === "ready" || node.source_type === "seed" ? 0.96 : 0.58;
+                }
                 const isHovered = hoveredNode?.id === node.id && !isSelected;
 
                 return (
@@ -384,6 +454,22 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
                     onMouseLeave={() => setHoveredNode(null)}
                     style={{ cursor: "pointer" }}
                   >
+                    {/* Cited halo — soft pulsing ring rendered behind the
+                        node. Only visible while a chat citation set is
+                        active and the node is in it (and the user hasn't
+                        explicitly selected something else). */}
+                    {isCited && !isSelected && !connectedNodeIds && (
+                      <circle
+                        cx={node.x}
+                        cy={node.y}
+                        r={node.r + 8}
+                        fill="none"
+                        stroke={color}
+                        strokeWidth={3}
+                        strokeOpacity={0.55}
+                        className="cited-halo"
+                      />
+                    )}
                     <circle
                       cx={node.x} cy={node.y} r={node.r}
                       fill={color}
@@ -440,7 +526,8 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
           </svg>
         ) : null}
 
-        {selectedSource ? <NodePopover node={selectedSource} onClose={() => onSelectSource?.(null)} /> : null}
+        {/* No popover — clicking a node bubbles up via onSelectSource and the
+            sidebar's source card expands inline with the overview content. */}
       </div>
 
       {/* Zoom controls — bottom-right */}
@@ -458,6 +545,18 @@ export default function DocumentWeb({ sources, edges, selectedSource, onSelectSo
           <RotateCcw className="h-4 w-4" />
         </button>
       </div>
+
+      {/* Citation-halo pulse: gentle opacity wave that draws the eye to
+          the cited nodes without strobing or being distracting. */}
+      <style>{`
+        @keyframes cited-halo-pulse {
+          0%, 100% { stroke-opacity: 0.45; }
+          50%      { stroke-opacity: 0.85; }
+        }
+        .cited-halo {
+          animation: cited-halo-pulse 1.8s ease-in-out infinite;
+        }
+      `}</style>
     </section>
   );
 }

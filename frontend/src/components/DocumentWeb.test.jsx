@@ -95,11 +95,6 @@ vi.mock("d3-force", () => {
   };
 });
 
-// Mock NodePopover — it's a separate component not under test here
-vi.mock("./NodePopover", () => ({
-  default: () => null,
-}));
-
 // Mock lucide-react icons to avoid SVG rendering issues in jsdom
 vi.mock("lucide-react", () => ({
   Crosshair: () => null,

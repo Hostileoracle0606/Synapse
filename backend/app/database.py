@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
-import math
 from threading import Lock
 from typing import Any
 from uuid import uuid4
@@ -20,80 +19,19 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _stored_embedding_dimension() -> int:
-    """Single source of truth — reads from config so it stays in sync with the model."""
-    return get_settings().embedding_dimension
-
-
-def _normalize_embedding(
-    embedding: Any,
-    *,
-    source_id: str | None = None,
-    chunk_index: int | None = None,
-    expected_dimension: int | None = None,
-) -> list[float]:
-    if embedding is None:
-        location = f"source {source_id}" if source_id else "chunk"
-        if chunk_index is not None:
-            location += f" chunk {chunk_index}"
-        raise ValueError(f"{location} embedding cannot be null")
-
-    if isinstance(embedding, (str, bytes)):
-        raise ValueError("chunk embedding must be an iterable of numeric values")
-
-    try:
-        values = [float(value) for value in embedding]
-    except TypeError as exc:
-        raise ValueError("chunk embedding must be an iterable of numeric values") from exc
-    except ValueError as exc:
-        raise ValueError("chunk embedding contains values that cannot be converted to float") from exc
-
-    if not values:
-        raise ValueError("chunk embedding cannot be empty")
-
-    if expected_dimension is not None and len(values) != expected_dimension:
-        location = f"source {source_id}" if source_id else "chunk"
-        if chunk_index is not None:
-            location += f" chunk {chunk_index}"
-        raise ValueError(
-            f"{location} embedding has dimension {len(values)}; expected {expected_dimension}"
-        )
-
-    if not all(math.isfinite(value) for value in values):
-        raise ValueError("chunk embedding must contain only finite numeric values")
-
-    return values
-
-
-def _prepare_chunk_payloads(
-    chunks: list[dict[str, Any]],
-    *,
-    expected_dimension: int | None,
-    source_id: str,
-) -> list[dict[str, Any]]:
-    prepared_chunks: list[dict[str, Any]] = []
-    inferred_dimension = expected_dimension
-
-    for chunk in chunks:
-        values = _normalize_embedding(
-            chunk.get("embedding"),
-            source_id=source_id,
-            chunk_index=chunk.get("chunk_index"),
-            expected_dimension=inferred_dimension,
-        )
-        if inferred_dimension is None:
-            inferred_dimension = len(values)
-        prepared_chunks.append({**chunk, "embedding": values})
-
-    return prepared_chunks
-
-
 class InMemoryRepository:
+    """In-process repository for notebooks/sources/edges/messages.
+
+    Used in single-process dev and on Render-style PaaS deploys where we
+    don't want to manage a separate Postgres. State is lost on restart —
+    that's intentional given Synapse's "one notebook, one session" UX.
+    For persistence, plug in SupabaseRepository via SUPABASE_URL/KEY env.
+    """
+
     def __init__(self) -> None:
         self._lock = Lock()
         self._notebooks: dict[str, dict[str, Any]] = {}
         self._sources: dict[str, dict[str, Any]] = {}
-        self._source_chunks: dict[str, dict[str, Any]] = {}
         self._edges: dict[str, dict[str, Any]] = {}
         self._messages: dict[str, dict[str, Any]] = {}
 
@@ -138,7 +76,6 @@ class InMemoryRepository:
             "source_type": source_type,
             "summary": None,
             "content": None,
-            "embedding": None,
             "status": status,
             "error_message": None,
             "created_at": _utc_now(),
@@ -148,14 +85,6 @@ class InMemoryRepository:
         return deepcopy(source)
 
     def update_source(self, source_id: str, **fields: Any) -> dict[str, Any] | None:
-        if "embedding" in fields and fields["embedding"] is not None:
-            fields = dict(fields)
-            fields["embedding"] = _normalize_embedding(
-                fields["embedding"],
-                source_id=source_id,
-                expected_dimension=None,
-            )
-
         with self._lock:
             source = self._sources.get(source_id)
             if not source:
@@ -169,81 +98,20 @@ class InMemoryRepository:
             sources = [source for source in self._sources.values() if source["notebook_id"] == notebook_id]
         return sorted((deepcopy(source) for source in sources), key=lambda item: item["created_at"])
 
-    def replace_source_chunks(
-        self,
-        source_id: str,
-        notebook_id: str,
-        chunks: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        prepared_chunks = _prepare_chunk_payloads(
-            chunks,
-            expected_dimension=None,
-            source_id=source_id,
-        )
-
+    def delete_source(self, source_id: str) -> bool:
+        """Remove a source and cascade to any edges that reference it."""
         with self._lock:
-            chunk_ids = [chunk_id for chunk_id, chunk in self._source_chunks.items() if chunk["source_id"] == source_id]
-            for chunk_id in chunk_ids:
-                del self._source_chunks[chunk_id]
-
-            stored_chunks: list[dict[str, Any]] = []
-            for chunk in prepared_chunks:
-                chunk_id = str(uuid4())
-                record = {
-                    "id": chunk_id,
-                    "source_id": source_id,
-                    "notebook_id": notebook_id,
-                    "chunk_index": chunk["chunk_index"],
-                    "content": chunk["content"],
-                    "char_start": chunk["char_start"],
-                    "char_end": chunk["char_end"],
-                    "embedding": chunk["embedding"],
-                    "created_at": _utc_now(),
-                }
-                self._source_chunks[chunk_id] = record
-                stored_chunks.append(deepcopy(record))
-
-        stored_chunks.sort(key=lambda item: item["chunk_index"])
-        return stored_chunks
-
-    def get_source_chunks(self, source_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            chunks = [chunk for chunk in self._source_chunks.values() if chunk["source_id"] == source_id]
-        return sorted((deepcopy(chunk) for chunk in chunks), key=lambda item: item["chunk_index"])
-
-    def get_notebook_chunks(self, notebook_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            chunks = [chunk for chunk in self._source_chunks.values() if chunk["notebook_id"] == notebook_id]
-        return sorted(
-            (deepcopy(chunk) for chunk in chunks),
-            key=lambda item: (item["source_id"], item["chunk_index"]),
-        )
-
-    def hybrid_search_chunks(
-        self,
-        notebook_id: str,
-        query_text: str,
-        query_embedding: list[float],
-        match_count: int,
-    ) -> list[dict[str, Any]]:
-        """Vector-only cosine fallback — no FTS available in memory."""
-        from app.services.graph import cosine_similarity
-
-        with self._lock:
-            chunks = [
-                chunk for chunk in self._source_chunks.values()
-                if chunk["notebook_id"] == notebook_id
+            if source_id not in self._sources:
+                return False
+            del self._sources[source_id]
+            edge_ids = [
+                edge_id
+                for edge_id, edge in self._edges.items()
+                if edge["source_a"] == source_id or edge["source_b"] == source_id
             ]
-
-        scored: list[dict[str, Any]] = []
-        for chunk in chunks:
-            raw = chunk.get("embedding") or []
-            emb = [float(v) for v in raw]
-            score = cosine_similarity(query_embedding, emb)
-            scored.append({**deepcopy(chunk), "rrf_score": score})
-
-        scored.sort(key=lambda c: c["rrf_score"], reverse=True)
-        return scored[:match_count]
+            for edge_id in edge_ids:
+                del self._edges[edge_id]
+            return True
 
     def create_edge(
         self,
@@ -288,13 +156,6 @@ class InMemoryRepository:
             edges = [edge for edge in self._edges.values() if edge["notebook_id"] == notebook_id]
         return [deepcopy(edge) for edge in edges]
 
-    def get_sources_with_embeddings(self, notebook_id: str) -> list[dict[str, Any]]:
-        return [
-            source
-            for source in self.get_sources(notebook_id)
-            if source.get("status") == "ready" and source.get("embedding")
-        ]
-
     def add_message(
         self,
         notebook_id: str,
@@ -322,6 +183,13 @@ class InMemoryRepository:
 
 
 class SupabaseRepository:
+    """Postgres-backed repository via Supabase. Drop-in replacement for
+    InMemoryRepository — same surface, persistent storage.
+
+    Activated when SUPABASE_URL + SUPABASE_KEY are set in the environment.
+    The schema is defined in ``supabase_schema.sql`` at the repo root.
+    """
+
     def __init__(self, client: Client) -> None:
         self._client = client
 
@@ -364,14 +232,6 @@ class SupabaseRepository:
         return result.data[0]
 
     def update_source(self, source_id: str, **fields: Any) -> dict[str, Any] | None:
-        if "embedding" in fields and fields["embedding"] is not None:
-            fields = dict(fields)
-            fields["embedding"] = _normalize_embedding(
-                fields["embedding"],
-                source_id=source_id,
-                expected_dimension=_stored_embedding_dimension(),
-            )
-
         result = self._client.table("sources").update(fields).eq("id", source_id).execute()
         return result.data[0] if result.data else None
 
@@ -379,70 +239,17 @@ class SupabaseRepository:
         result = self._client.table("sources").select("*").eq("notebook_id", notebook_id).order("created_at").execute()
         return result.data
 
-    def replace_source_chunks(
-        self,
-        source_id: str,
-        notebook_id: str,
-        chunks: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        prepared_chunks = _prepare_chunk_payloads(
-            chunks,
-            expected_dimension=_stored_embedding_dimension(),
-            source_id=source_id,
-        )
-
-        if not prepared_chunks:
-            self._client.table("source_chunks").delete().eq("source_id", source_id).execute()
-            return []
-
-        self._client.table("source_chunks").delete().eq("source_id", source_id).execute()
-        payload = [
-            {
-                "source_id": source_id,
-                "notebook_id": notebook_id,
-                "chunk_index": chunk["chunk_index"],
-                "content": chunk["content"],
-                "char_start": chunk["char_start"],
-                "char_end": chunk["char_end"],
-                "embedding": chunk["embedding"],
-            }
-            for chunk in prepared_chunks
-        ]
-        result = self._client.table("source_chunks").insert(payload).execute()
-        return sorted(result.data, key=lambda item: item["chunk_index"])
-
-    def get_source_chunks(self, source_id: str) -> list[dict[str, Any]]:
-        result = self._client.table("source_chunks").select("*").eq("source_id", source_id).order("chunk_index").execute()
-        return result.data
-
-    def get_notebook_chunks(self, notebook_id: str) -> list[dict[str, Any]]:
-        result = (
-            self._client.table("source_chunks")
-            .select("*")
-            .eq("notebook_id", notebook_id)
-            .order("source_id")
-            .order("chunk_index")
-            .execute()
-        )
-        return result.data
-
-    def hybrid_search_chunks(
-        self,
-        notebook_id: str,
-        query_text: str,
-        query_embedding: list[float],
-        match_count: int,
-    ) -> list[dict[str, Any]]:
-        result = self._client.rpc(
-            "hybrid_search_chunks",
-            {
-                "p_notebook_id": notebook_id,
-                "p_query_text": query_text,
-                "p_query_embedding": query_embedding,
-                "p_match_count": match_count,
-            },
-        ).execute()
-        return result.data
+    def delete_source(self, source_id: str) -> bool:
+        """Cascade to edges. Assumes ON DELETE CASCADE on the schema's
+        edges → sources foreign keys; falls back to explicit deletes."""
+        try:
+            self._client.table("edges").delete().or_(
+                f"source_a.eq.{source_id},source_b.eq.{source_id}"
+            ).execute()
+        except Exception:
+            pass
+        result = self._client.table("sources").delete().eq("id", source_id).execute()
+        return bool(result.data)
 
     def create_edge(
         self,
@@ -478,17 +285,6 @@ class SupabaseRepository:
 
     def get_edges(self, notebook_id: str) -> list[dict[str, Any]]:
         result = self._client.table("edges").select("*").eq("notebook_id", notebook_id).execute()
-        return result.data
-
-    def get_sources_with_embeddings(self, notebook_id: str) -> list[dict[str, Any]]:
-        result = (
-            self._client.table("sources")
-            .select("*")
-            .eq("notebook_id", notebook_id)
-            .eq("status", "ready")
-            .not_.is_("embedding", "null")
-            .execute()
-        )
         return result.data
 
     def add_message(
@@ -533,6 +329,9 @@ def get_repository() -> InMemoryRepository | SupabaseRepository:
     return _repository
 
 
+# ── Async wrappers — sole entry point used by the rest of the app ─────────
+
+
 async def create_notebook(title: str, seed_url: str | None = None, seed_text: str | None = None) -> dict[str, Any]:
     return get_repository().create_notebook(title=title, seed_url=seed_url, seed_text=seed_text)
 
@@ -569,29 +368,8 @@ async def get_sources(notebook_id: str) -> list[dict[str, Any]]:
     return get_repository().get_sources(notebook_id)
 
 
-async def replace_source_chunks(
-    source_id: str,
-    notebook_id: str,
-    chunks: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    return get_repository().replace_source_chunks(source_id, notebook_id, chunks)
-
-
-async def get_source_chunks(source_id: str) -> list[dict[str, Any]]:
-    return get_repository().get_source_chunks(source_id)
-
-
-async def get_notebook_chunks(notebook_id: str) -> list[dict[str, Any]]:
-    return get_repository().get_notebook_chunks(notebook_id)
-
-
-async def hybrid_search_chunks(
-    notebook_id: str,
-    query_text: str,
-    query_embedding: list[float],
-    match_count: int,
-) -> list[dict[str, Any]]:
-    return get_repository().hybrid_search_chunks(notebook_id, query_text, query_embedding, match_count)
+async def delete_source(source_id: str) -> bool:
+    return get_repository().delete_source(source_id)
 
 
 async def create_edge(
@@ -612,10 +390,6 @@ async def create_edge(
 
 async def get_edges(notebook_id: str) -> list[dict[str, Any]]:
     return get_repository().get_edges(notebook_id)
-
-
-async def get_sources_with_embeddings(notebook_id: str) -> list[dict[str, Any]]:
-    return get_repository().get_sources_with_embeddings(notebook_id)
 
 
 async def add_message(

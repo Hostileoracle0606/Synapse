@@ -3,12 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import ssl
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Optional
 
+import certifi
 import httpx
 
 from app.config import get_settings
+
+
+# Build a single SSL context backed by certifi's CA bundle. Without this,
+# httpx falls back to Python's default trust store, which on Homebrew Python
+# doesn't always resolve a usable path → "unable to get local issuer
+# certificate" errors when crawling sites with chains like Let's Encrypt.
+_SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 logger = logging.getLogger(__name__)
 
@@ -110,58 +120,234 @@ async def crawl_url_with_firecrawl(url: str, timeout: float = 30.0) -> dict[str,
         return None
 
 
-async def smart_crawl_url(url: str, source_type: str = "webpage") -> dict[str, str] | None:
-    """Route *url* to the best extractor and always return success dict or None.
+async def _resolve_final_url_and_type(url: str, timeout: float = 8.0) -> tuple[str, str]:
+    """HEAD-probe *url*, follow redirects, return (final_url, content_type).
 
-    PDF routing (either explicit source_type or .pdf extension):
-        Firecrawl first → None on failure (no httpx fallback)
+    Critical for Gemini-discovered URLs which arrive wrapped in
+    ``vertexaisearch.cloud.google.com/grounding-api-redirect/...`` — the
+    routing decision (HTML vs PDF vs YouTube) needs the post-redirect
+    target, not the wrapper.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            verify=_SSL_CTX,
+            headers={"User-Agent": "Synapse-Bot/1.0 (research tool)"},
+        ) as client:
+            response = await client.head(url)
+            final = str(response.url)
+            ct = response.headers.get("content-type", "").split(";")[0].strip().lower()
+            return final, ct
+    except Exception as exc:
+        logger.debug("HEAD probe failed for %s (%s) — using URL as-is", url, exc)
+        return url, ""
 
-    Webpage routing:
-        httpx+trafilatura first → Firecrawl fallback on None/error/weak text
-        If Firecrawl also unavailable/fails → return weak primary if text >= threshold;
-        otherwise None
+
+async def smart_crawl_url(
+    url: str,
+    source_type: str = "webpage",
+    *,
+    api_key: Optional[str] = None,
+) -> dict[str, str] | None:
+    """Route *url* to the right extractor based on the actual content type.
+
+    Decision tree (after resolving redirects):
+
+    - YouTube URL  → Gemini native video ingest (transcribes the video)
+    - PDF (URL extension OR Content-Type: application/pdf) →
+        Gemini native PDF parse → Firecrawl fallback on failure
+    - Other binary (image/audio/video/zip/octet-stream) → bail (no parser)
+    - HTML/text → trafilatura primary → Firecrawl fallback on weak text
+
+    BYOK: ``api_key`` flows into the Gemini-native ingesters. HTML path
+    doesn't need it.
     """
     settings = get_settings()
 
-    if _looks_like_pdf(url, source_type):
-        return await crawl_url_with_firecrawl(url)
+    # Local import: gemini_ingest imports _SSL_CTX from this module, so we
+    # defer the import to avoid a circular-import at module load time.
+    from app.services.gemini_ingest import (
+        gemini_ingest_pdf,
+        gemini_ingest_via_tools,
+        gemini_ingest_youtube,
+        is_tools_fallback_url,
+        is_youtube_url,
+    )
 
-    # Primary: httpx + trafilatura
+    # ── Resolve redirects to discover the actual destination ───────────────
+    # Gemini grounding wraps every URL in a vertexaisearch redirect, so the
+    # input ``url`` rarely tells us the true type. The HEAD probe also gives
+    # us the server-reported Content-Type for free.
+    final_url, final_ct = await _resolve_final_url_and_type(url)
+
+    # Helper: tag every successful return with the resolved URL so the
+    # worker can write it back onto the source record (replacing the original
+    # vertexaisearch redirect wrapper). This is what makes URL-based dedup
+    # actually work post-crawl.
+    def _tag(result, source_type):
+        if result is None:
+            return None
+        result.setdefault("source_type", source_type)
+        result.setdefault("final_url", final_url or url)
+        return result
+
+    # ── YouTube → native Gemini video ingest ───────────────────────────────
+    # We tried routing YouTube through gemini_ingest_via_tools (url_context
+    # + google_search) in an earlier iteration; Gemini's url_context tool
+    # explicitly refuses YouTube URLs (returns NOT_ACCESSIBLE). The video
+    # file_uri path remains the only Gemini-native way to get transcripts.
+    if is_youtube_url(final_url) or is_youtube_url(url):
+        return _tag(await gemini_ingest_youtube(final_url, api_key=api_key), "youtube")
+
+    # ── PDF (extension OR resolved content-type) → native Gemini PDF parse ─
+    is_pdf = (
+        _looks_like_pdf(url, source_type)
+        or _looks_like_pdf(final_url, source_type)
+        or final_ct == "application/pdf"
+    )
+    if is_pdf:
+        gemini_pdf = await gemini_ingest_pdf(final_url or url, api_key=api_key)
+        if gemini_pdf:
+            return _tag(gemini_pdf, "pdf")
+        return _tag(await crawl_url_with_firecrawl(final_url or url), "pdf")
+
+    # ── Tools-fallback domains (Twitter/X, Reddit, LinkedIn, Threads) ──────
+    if is_tools_fallback_url(final_url) or is_tools_fallback_url(url):
+        return _tag(
+            await gemini_ingest_via_tools(final_url or url, api_key=api_key),
+            "social",
+        )
+
+    # ── Other binary content → no parser, bail early ────────────────────────
+    if final_ct and _content_type_is_binary(final_ct):
+        logger.warning("Skipping unsupported binary content (%s): %s", final_ct, final_url)
+        return None
+
+    # ── HTML / text path: trafilatura primary, Firecrawl fallback ──────────
     primary = await crawl_url(url)
 
-    # Determine whether primary is good enough
     primary_text = (primary or {}).get("text", "") if primary and not primary.get("error") else ""
     primary_is_weak = len(primary_text.strip()) < settings.firecrawl_fallback_min_chars
 
     if not primary_is_weak:
-        # Strip error keys — return clean success dict only
-        return {"text": primary_text, "title": (primary or {}).get("title") or url}
+        return _tag(
+            {
+                "text": primary_text,
+                "title": (primary or {}).get("title") or _hostname_label(final_url or url),
+            },
+            "webpage",
+        )
 
-    # Try Firecrawl fallback
     fc_result = await crawl_url_with_firecrawl(url)
     if fc_result:
-        return fc_result
+        if not fc_result.get("title") or fc_result["title"].lower().startswith(("http://", "https://")):
+            fc_result["title"] = _hostname_label(final_url or url)
+        return _tag(fc_result, "webpage")
 
-    # Firecrawl unavailable or failed — return weak primary if it has usable text
     if primary_text:
-        return {"text": primary_text, "title": (primary or {}).get("title") or url}
+        return _tag(
+            {
+                "text": primary_text,
+                "title": (primary or {}).get("title") or _hostname_label(final_url or url),
+            },
+            "webpage",
+        )
 
-    return None
+    # ── Last-resort: tools-based ingest ────────────────────────────────────
+    logger.info("All cheap extractors failed; trying tools-based fallback for %s", url)
+    return _tag(
+        await gemini_ingest_via_tools(final_url or url, api_key=api_key),
+        "webpage",
+    )
+
+
+_TITLE_TAG_RE = re.compile(r"<title[^>]*>([^<]+)</title>", re.IGNORECASE | re.DOTALL)
+_OG_TITLE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+_TITLE_NOISE_SUFFIXES = (
+    " - Wikipedia",
+    " | Wikipedia",
+    " - GitHub",
+    " - YouTube",
+)
+
+
+def _clean_title(raw: str) -> str:
+    """Strip tags, collapse whitespace, drop common site-name suffixes."""
+    if not raw:
+        return ""
+    text = _TAG_STRIP_RE.sub("", raw)
+    text = _WS_RE.sub(" ", text).strip()
+    if not text:
+        return ""
+    # Drop boilerplate suffixes — keeps "Attention Is All You Need" not
+    # "Attention Is All You Need - arxiv.org" etc.
+    for suffix in _TITLE_NOISE_SUFFIXES:
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+    return text[:200]
 
 
 def _extract_title_from_metadata(html: str) -> str:
-    if trafilatura is None:
-        return ""
+    """Best-effort title extraction with no LLM cost.
 
-    metadata = trafilatura.extract(html, output_format="json", include_comments=False)
-    if not metadata:
-        return ""
+    Tries in order:
+    1. ``<meta property="og:title">``  (most reliable for news/articles)
+    2. ``<title>`` tag                (universal fallback)
+    3. trafilatura's article-content title (works on blog-shaped pages)
+    4. The first ``<h1>`` (last resort for sparse pages)
+    """
+    # 1. og:title
+    m = _OG_TITLE_RE.search(html)
+    if m:
+        cleaned = _clean_title(m.group(1))
+        if cleaned and not cleaned.lower().startswith(("http://", "https://")):
+            return cleaned
 
+    # 2. <title> tag — typically wraps the page title
+    m = _TITLE_TAG_RE.search(html)
+    if m:
+        cleaned = _clean_title(m.group(1))
+        if cleaned and not cleaned.lower().startswith(("http://", "https://")):
+            return cleaned
+
+    # 3. trafilatura's article-title (only useful if it actually returns one;
+    # often empty on landing pages and search-result pages)
+    if trafilatura is not None:
+        try:
+            metadata = trafilatura.extract(html, output_format="json", include_comments=False)
+            if metadata:
+                parsed = json.loads(metadata)
+                cleaned = _clean_title(parsed.get("title") or "")
+                if cleaned:
+                    return cleaned
+        except (json.JSONDecodeError, Exception):
+            pass
+
+    # 4. First <h1>
+    m = _H1_RE.search(html)
+    if m:
+        cleaned = _clean_title(m.group(1))
+        if cleaned:
+            return cleaned
+
+    return ""
+
+
+def _hostname_label(url: str) -> str:
+    """Friendly hostname-based label for fallback titles."""
     try:
-        parsed = json.loads(metadata)
-    except json.JSONDecodeError:
-        return ""
-    return parsed.get("title") or ""
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+        return host.removeprefix("www.") if host else url
+    except Exception:
+        return url
 
 
 def _fallback_result(url: str, html: str) -> dict[str, str]:
@@ -171,7 +357,10 @@ def _fallback_result(url: str, html: str) -> dict[str, str]:
     if len(text) < 50:
         return _failure_result(url)
     return {
-        "title": url,
+        # Try to recover a real title from the HTML even on the fallback path
+        # (trafilatura returned weak text — that doesn't mean the <title>
+        # tag is missing). Hostname is the last-resort label.
+        "title": _extract_title_from_metadata(html) or _hostname_label(url),
         "text": text[: settings.max_document_chars],
     }
 
@@ -190,12 +379,13 @@ def _content_type_is_valid(content_type: str) -> bool:
     return any(ct.startswith(prefix) for prefix in _VALID_CONTENT_TYPE_PREFIXES)
 
 
-async def crawl_url(url: str, timeout: float = 15.0) -> dict[str, str] | None:
+async def crawl_url(url: str, timeout: float = 30.0) -> dict[str, str] | None:
     settings = get_settings()
     logger.info("Crawling: %s", url)
     client_kwargs = dict(
         timeout=timeout,
         follow_redirects=True,
+        verify=_SSL_CTX,
         headers={"User-Agent": "Synapse-Bot/1.0 (research tool)"},
     )
 
@@ -235,6 +425,8 @@ async def crawl_url(url: str, timeout: float = 15.0) -> dict[str, str] | None:
         return _fallback_result(url, html)
 
     truncated = text[: settings.max_document_chars]
-    title = _extract_title_from_metadata(html) or url
+    # Title preference: rich metadata → og:title/title tag/h1 → cleaned hostname.
+    # Never return the raw URL as the title; it makes the sidebar unreadable.
+    title = _extract_title_from_metadata(html) or _hostname_label(url)
     logger.info("Crawl OK - %d chars, title=%r: %s", len(truncated), title, url)
     return {"text": truncated, "title": title}

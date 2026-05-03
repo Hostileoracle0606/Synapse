@@ -21,9 +21,19 @@ export default function App() {
   const [selectedSource, setSelectedSource] = useState(null);
   const [initialNodePositions, setInitialNodePositions] = useState(null);
   const [layoutRevealing, setLayoutRevealing] = useState(false);
+  // citedSourceIds is the set of source IDs cited by the latest assistant
+  // chat response. The graph view uses this to highlight just those nodes
+  // (replacing the old "Cited sources" pill list at the bottom of the chat).
+  const [citedSourceIds, setCitedSourceIds] = useState([]);
+  // "view" gates the formation→main transition. We hold the formation
+  // screen for a moment after notebook becomes ready so the done overlay
+  // can fade in/out before the main view replaces it.
+  const [view, setView] = useState("formation"); // "formation" | "main"
+  const initialNotebookStatusRef = useRef(null);
   const { notebook, loading, error, refresh } = useNotebook(notebookId);
   const { messages, send, sending, error: chatError } = useChat(notebookId);
   const revealTimerRef = useRef(null);
+  const transitionTimerRef = useRef(null);
 
   useEffect(() => {
     if (notebookId) {
@@ -31,6 +41,11 @@ export default function App() {
     } else {
       window.sessionStorage.removeItem("synapse:notebookId");
     }
+    // Reset transition state for the new notebook.
+    initialNotebookStatusRef.current = null;
+    setView("formation");
+    // Clear any citation highlight carried over from the previous notebook.
+    setCitedSourceIds([]);
   }, [notebookId]);
 
   useEffect(() => {
@@ -47,8 +62,48 @@ export default function App() {
   }, [notebook]);
 
   useEffect(() => {
-    return () => { if (revealTimerRef.current) clearTimeout(revealTimerRef.current); };
+    return () => {
+      // revealTimerRef now holds an rAF id (not a timeout) — see the
+      // view→main effect below. Using cancelAnimationFrame for rAF ids
+      // is correct; passing a stale timeout id to clearTimeout is also
+      // a no-op so this is safe across both code paths.
+      if (revealTimerRef.current) {
+        try { window.cancelAnimationFrame(revealTimerRef.current); } catch {}
+      }
+      if (transitionTimerRef.current) clearTimeout(transitionTimerRef.current);
+    };
   }, []);
+
+  // Transition state machine: when the notebook flips into ready/error,
+  // hold the formation screen for ~1.8s (so the done overlay has time to
+  // play), then swap to the main view. If we mounted onto an already-ready
+  // notebook (resume from sessionStorage), skip formation entirely.
+  useEffect(() => {
+    if (!notebook) return;
+    const isReady = notebook.status === "ready" || notebook.status === "error";
+
+    if (initialNotebookStatusRef.current === null) {
+      initialNotebookStatusRef.current = notebook.status;
+      if (isReady) {
+        setView("main");
+        return;
+      }
+    }
+
+    if (isReady && view === "formation") {
+      transitionTimerRef.current = setTimeout(() => setView("main"), 1800);
+    } else if (!isReady && view === "main") {
+      // Edge case: notebook went back into processing (re-crawl?). Fall
+      // back to formation gracefully.
+      setView("formation");
+    }
+    return () => {
+      if (transitionTimerRef.current) {
+        clearTimeout(transitionTimerRef.current);
+        transitionTimerRef.current = null;
+      }
+    };
+  }, [notebook, view]);
 
   const handleCreateNotebook = async (payload) => {
     setCreating(true);
@@ -78,14 +133,40 @@ export default function App() {
     }
   };
 
+  // FormationScreen calls this when it detects ready/error and captures
+  // the simulation's final node positions. We just store them; the actual
+  // panel reveal animation fires when the view actually changes to main
+  // (see the effect below), not now.
   const handleFormationReady = useCallback((positions) => {
     setInitialNodePositions(positions);
-    setLayoutRevealing(true);
-    revealTimerRef.current = setTimeout(() => setLayoutRevealing(false), 500);
   }, []);
 
+  // Trigger the entry animation for SourcesPanel + ChatPanel exactly when
+  // the view becomes main. They're rendered with revealing=true (width 0)
+  // for one frame, then revealing flips to false and the panels slide in
+  // from their respective edges. Without this two-frame dance, the panels
+  // appear at full width with no animation.
+  useEffect(() => {
+    if (view !== "main") return;
+    setLayoutRevealing(true);
+    // Two requestAnimationFrame hops ensure the first paint happens with
+    // revealing=true (panels at width 0); the second paint flips to
+    // revealing=false, which fires the CSS width transition.
+    const raf1 = window.requestAnimationFrame(() => {
+      const raf2 = window.requestAnimationFrame(() => {
+        setLayoutRevealing(false);
+      });
+      revealTimerRef.current = raf2;
+    });
+    return () => {
+      window.cancelAnimationFrame(raf1);
+      if (revealTimerRef.current) {
+        window.cancelAnimationFrame(revealTimerRef.current);
+      }
+    };
+  }, [view]);
+
   const sources = notebook?.sources || [];
-  const statusLabel = notebook?.status ? notebook.status : loading ? "loading" : "";
 
   if (!notebookId) {
     return (
@@ -99,7 +180,7 @@ export default function App() {
     );
   }
 
-  if (notebook?.status !== "ready" && notebook?.status !== "error") {
+  if (view === "formation") {
     return (
       <FormationScreen
         notebook={notebook}
@@ -112,11 +193,7 @@ export default function App() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-[radial-gradient(circle_at_top,rgba(66,133,244,0.08),transparent_40%),linear-gradient(180deg,#f4f8fb_0%,#eef3f8_100%)] text-[#1f1f1f]">
-      <Header
-        title={notebook?.title || "Synapse Notebook"}
-        status={statusLabel}
-        onAddSource={() => setComposerOpen(true)}
-      />
+      <Header title={notebook?.title || "Synapse Notebook"} />
 
       <main className="flex flex-1 flex-col gap-4 px-4 pb-4 lg:flex-row min-h-0 overflow-hidden">
         <SourcesPanel
@@ -133,6 +210,7 @@ export default function App() {
           selectedSource={selectedSource}
           onSelectSource={setSelectedSource}
           initialNodePositions={initialNodePositions}
+          citedSourceIds={citedSourceIds}
         />
 
         <ChatPanel
@@ -141,6 +219,7 @@ export default function App() {
           sending={sending}
           sources={sources}
           onSelectSource={setSelectedSource}
+          onCitedSourcesChange={setCitedSourceIds}
           error={chatError}
           revealing={layoutRevealing}
         />
